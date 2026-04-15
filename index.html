@@ -441,7 +441,7 @@
 
         async function readDirectory(entry) {
             const files = [];
-            
+
             if (entry.isFile) {
                 if (entry.name.toLowerCase().endsWith('.jpg') || entry.name.toLowerCase().endsWith('.jpeg')) {
                     const file = await new Promise(resolve => entry.file(resolve));
@@ -449,13 +449,16 @@
                 }
             } else if (entry.isDirectory) {
                 const reader = entry.createReader();
-                const entries = await new Promise(resolve => reader.readEntries(resolve));
-                for (const subEntry of entries) {
-                    const subFiles = await readDirectory(subEntry);
-                    files.push(...subFiles);
+                while (true) {
+                    const entries = await new Promise(resolve => reader.readEntries(resolve));
+                    if (entries.length === 0) break;
+                    for (const subEntry of entries) {
+                        const subFiles = await readDirectory(subEntry);
+                        files.push(...subFiles);
+                    }
                 }
             }
-            
+
             return files;
         }
 
@@ -481,10 +484,11 @@
             exifData = [];
             progressBar.style.display = 'block';
             loadingText.style.display = 'block';
-            
+
             let completed = 0;
             const total = files.length;
-            
+            const CONCURRENCY = 10;
+
             const processFile = async (file) => {
                 try {
                     const data = await readExifDataFast(file);
@@ -499,12 +503,17 @@
                 }
             };
 
-            const results = await Promise.all(files.map(processFile));
+            const results = [];
+            for (let i = 0; i < files.length; i += CONCURRENCY) {
+                const batch = files.slice(i, i + CONCURRENCY);
+                const batchResults = await Promise.all(batch.map(processFile));
+                results.push(...batchResults);
+            }
             exifData = results.filter(d => d !== null);
 
             progressBar.style.display = 'none';
             loadingText.style.display = 'none';
-            
+
             if (exifData.length > 0) {
                 displayResults();
             }
@@ -554,7 +563,7 @@
                 height: null
             };
 
-            if (view.getUint16(0, false) !== 0xFFD8) {
+            if (buffer.byteLength < 2 || view.getUint16(0, false) !== 0xFFD8) {
                 return result;
             }
 
@@ -563,11 +572,12 @@
             let tiffOffset = null;
             let littleEndian = false;
 
-            while (offset < buffer.byteLength - 2) {
+            while (offset + 2 <= buffer.byteLength) {
                 const marker = view.getUint16(offset, false);
                 offset += 2;
 
                 if (marker === 0xFFE1) {
+                    if (offset + 6 > buffer.byteLength) break;
                     const length = view.getUint16(offset, false);
                     const header = String.fromCharCode(
                         view.getUint8(offset + 2),
@@ -578,9 +588,10 @@
 
                     if (header === 'Exif') {
                         tiffOffset = offset + 8;
+                        if (tiffOffset + 8 > buffer.byteLength) break;
                         const byteOrder = view.getUint16(tiffOffset, false);
                         littleEndian = byteOrder === 0x4949;
-                        
+
                         if (view.getUint16(tiffOffset + 2, littleEndian) === 0x002A) {
                             exifOffset = tiffOffset + view.getUint32(tiffOffset + 4, littleEndian);
                         }
@@ -589,15 +600,16 @@
                 }
 
                 if ((marker & 0xFF00) !== 0xFF00) break;
-                
+
+                if (offset + 2 > buffer.byteLength) break;
                 const length = view.getUint16(offset, false);
                 offset += length;
             }
 
-            if (!exifOffset) return result;
+            if (!exifOffset || exifOffset > buffer.byteLength) return result;
 
             const tags = readIFD(view, exifOffset, littleEndian, tiffOffset, buffer);
-            
+
             result.aperture = parseAperture(tags[0x829D]);
             result.shutter = parseShutter(tags[0x829A]);
             result.focalLength = parseFocalLength(tags[0x920A]);
@@ -612,59 +624,135 @@
 
         function readIFD(view, offset, littleEndian, tiffOffset, buffer) {
             const tags = {};
+            if (offset + 2 > buffer.byteLength) return tags;
             const numEntries = view.getUint16(offset, littleEndian);
             offset += 2;
 
+            const typeSizeMap = {
+                1: 1,  // BYTE
+                2: 1,  // ASCII
+                3: 2,  // SHORT
+                4: 4,  // LONG
+                5: 8,  // RATIONAL
+                7: 1,  // UNDEFINED
+                9: 4,  // SLONG
+                10: 8  // SRATIONAL
+            };
+
             for (let i = 0; i < numEntries; i++) {
+                if (offset + 12 > buffer.byteLength) break;
                 const tagId = view.getUint16(offset, littleEndian);
                 const tagType = view.getUint16(offset + 2, littleEndian);
                 const numValues = view.getUint32(offset + 4, littleEndian);
-                const valueOffset = offset + 8;
+                const valueOffsetField = offset + 8;
+
+                const typeSize = typeSizeMap[tagType] || 1;
+                const totalSize = typeSize * numValues;
+                const dataOffset = totalSize > 4
+                    ? tiffOffset + view.getUint32(valueOffsetField, littleEndian)
+                    : valueOffsetField;
 
                 let value;
                 switch (tagType) {
-                    case 1:
-                        value = view.getUint8(valueOffset);
-                        break;
-                    case 2:
-                        const strLen = numValues;
-                        const strOffset = numValues > 4 ? view.getUint32(valueOffset, littleEndian) : valueOffset;
-                        try {
-                            const bytes = new Uint8Array(buffer, tiffOffset + strOffset, strLen - 1);
-                            value = new TextDecoder('utf-8').decode(bytes).trim();
-                        } catch(e) {
-                            value = '';
+                    case 1: { // BYTE
+                        if (numValues === 1) {
+                            value = view.getUint8(dataOffset);
+                        } else {
+                            if (dataOffset + numValues > buffer.byteLength) {
+                                value = null;
+                            } else {
+                                value = view.getUint8(dataOffset);
+                            }
                         }
                         break;
-                    case 3:
-                        value = view.getUint16(valueOffset, littleEndian);
+                    }
+                    case 2: { // ASCII
+                        const strLen = numValues;
+                        if (dataOffset + strLen > buffer.byteLength) {
+                            value = '';
+                        } else {
+                            try {
+                                const actualLen = strLen > 0 ? strLen - 1 : 0;
+                                const bytes = new Uint8Array(buffer, dataOffset, actualLen);
+                                value = new TextDecoder('utf-8').decode(bytes).trim();
+                            } catch (e) {
+                                value = '';
+                            }
+                        }
                         break;
-                    case 4:
-                        value = view.getUint32(valueOffset, littleEndian);
+                    }
+                    case 3: { // SHORT
+                        if (numValues === 1) {
+                            value = view.getUint16(dataOffset, littleEndian);
+                        } else {
+                            if (dataOffset + 2 > buffer.byteLength) {
+                                value = null;
+                            } else {
+                                value = view.getUint16(dataOffset, littleEndian);
+                            }
+                        }
                         break;
-                    case 5:
-                        const rationalOffset = view.getUint32(valueOffset, littleEndian);
-                        value = {
-                            numerator: view.getUint32(tiffOffset + rationalOffset, littleEndian),
-                            denominator: view.getUint32(tiffOffset + rationalOffset + 4, littleEndian)
-                        };
+                    }
+                    case 4: { // LONG
+                        if (numValues === 1) {
+                            value = view.getUint32(dataOffset, littleEndian);
+                        } else {
+                            if (dataOffset + 4 > buffer.byteLength) {
+                                value = null;
+                            } else {
+                                value = view.getUint32(dataOffset, littleEndian);
+                            }
+                        }
                         break;
-                    case 7:
-                        const undefOffset = numValues > 4 ? view.getUint32(valueOffset, littleEndian) : valueOffset;
-                        value = new Uint8Array(buffer, tiffOffset + undefOffset, numValues);
+                    }
+                    case 5: { // RATIONAL
+                        if (dataOffset + 8 > buffer.byteLength) {
+                            value = null;
+                        } else {
+                            value = {
+                                numerator: view.getUint32(dataOffset, littleEndian),
+                                denominator: view.getUint32(dataOffset + 4, littleEndian)
+                            };
+                        }
                         break;
-                    case 9:
-                        value = view.getInt32(valueOffset, littleEndian);
+                    }
+                    case 7: { // UNDEFINED
+                        if (dataOffset + numValues > buffer.byteLength) {
+                            value = null;
+                        } else {
+                            value = new Uint8Array(buffer, dataOffset, numValues);
+                        }
                         break;
-                    case 10:
-                        const srOffset = view.getUint32(valueOffset, littleEndian);
-                        value = {
-                            numerator: view.getInt32(tiffOffset + srOffset, littleEndian),
-                            denominator: view.getInt32(tiffOffset + srOffset + 4, littleEndian)
-                        };
+                    }
+                    case 9: { // SLONG
+                        if (numValues === 1) {
+                            value = view.getInt32(dataOffset, littleEndian);
+                        } else {
+                            if (dataOffset + 4 > buffer.byteLength) {
+                                value = null;
+                            } else {
+                                value = view.getInt32(dataOffset, littleEndian);
+                            }
+                        }
                         break;
+                    }
+                    case 10: { // SRATIONAL
+                        if (dataOffset + 8 > buffer.byteLength) {
+                            value = null;
+                        } else {
+                            value = {
+                                numerator: view.getInt32(dataOffset, littleEndian),
+                                denominator: view.getInt32(dataOffset + 4, littleEndian)
+                            };
+                        }
+                        break;
+                    }
                     default:
-                        value = view.getUint32(valueOffset, littleEndian);
+                        if (dataOffset + 4 > buffer.byteLength) {
+                            value = null;
+                        } else {
+                            value = view.getUint32(dataOffset, littleEndian);
+                        }
                 }
 
                 tags[tagId] = value;
@@ -673,8 +761,11 @@
 
             const exifIFDOffset = tags[0x8769];
             if (exifIFDOffset) {
-                const exifTags = readIFD(view, tiffOffset + exifIFDOffset, littleEndian, tiffOffset, buffer);
-                Object.assign(tags, exifTags);
+                const nextOffset = tiffOffset + exifIFDOffset;
+                if (nextOffset + 2 <= buffer.byteLength) {
+                    const exifTags = readIFD(view, nextOffset, littleEndian, tiffOffset, buffer);
+                    Object.assign(tags, exifTags);
+                }
             }
 
             return tags;
@@ -879,30 +970,38 @@
             });
         }
 
+        function createCell(text, className, title) {
+            const td = document.createElement('td');
+            td.textContent = text;
+            if (className) td.className = className;
+            if (title) td.title = title;
+            return td;
+        }
+
         function updateTable() {
             const tbody = document.getElementById('tableBody');
             tbody.innerHTML = '';
 
             exifData.forEach((item, index) => {
                 const row = document.createElement('tr');
-                row.innerHTML = `
-                    <td>${index + 1}</td>
-                    <td class="folder-cell" title="${item.folder || '-'}">${item.folder || '-'}</td>
-                    <td>${item.fileName}</td>
-                    <td>${item.aperture ? 'f/' + item.aperture : '-'}</td>
-                    <td>${item.shutter || '-'}</td>
-                    <td>${item.focalLength ? item.focalLength + 'mm' : '-'}</td>
-                    <td>${item.iso || '-'}</td>
-                    <td>${item.camera || '-'}</td>
-                    <td>${formatDateTime(item.dateTime) || '-'}</td>
-                `;
+                row.appendChild(createCell(index + 1));
+                row.appendChild(createCell(item.folder || '-', 'folder-cell', item.folder || '-'));
+                row.appendChild(createCell(item.fileName));
+                row.appendChild(createCell(item.aperture ? 'f/' + item.aperture : '-'));
+                row.appendChild(createCell(item.shutter || '-'));
+                row.appendChild(createCell(item.focalLength ? item.focalLength + 'mm' : '-'));
+                row.appendChild(createCell(item.iso || '-'));
+                row.appendChild(createCell(item.camera || '-'));
+                row.appendChild(createCell(formatDateTime(item.dateTime) || '-'));
                 tbody.appendChild(row);
             });
         }
 
         function formatDateTime(dateTime) {
             if (!dateTime) return null;
-            return dateTime.replace(/:/g, '-').replace(/-/g, ':', 2);
+            const match = dateTime.match(/^(\d{4}):(\d{2}):(\d{2})\s(\d{2}):(\d{2}):(\d{2})$/);
+            if (!match) return dateTime;
+            return `${match[1]}-${match[2]}-${match[3]} ${match[4]}:${match[5]}:${match[6]}`;
         }
 
         function exportCSV() {
@@ -930,6 +1029,21 @@
             link.href = URL.createObjectURL(blob);
             link.download = 'exif_data_export.csv';
             link.click();
+        }
+
+        if (!CanvasRenderingContext2D.prototype.roundRect) {
+            CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r) {
+                if (w < 2 * r) r = w / 2;
+                if (h < 2 * r) r = h / 2;
+                this.beginPath();
+                this.moveTo(x + r, y);
+                this.arcTo(x + w, y, x + w, y + h, r);
+                this.arcTo(x + w, y + h, x, y + h, r);
+                this.arcTo(x, y + h, x, y, r);
+                this.arcTo(x, y, x + w, y, r);
+                this.closePath();
+                return this;
+            };
         }
 
         window.addEventListener('resize', () => {
